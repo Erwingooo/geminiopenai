@@ -45,22 +45,22 @@ export default {
               
               if (request.method === "POST") {
                 try {
-                  // 尝试解析请求体
-                  const requestBody = await request.clone().json();
-                  console.log(`[DEBUG] 图像生成请求体: ${JSON.stringify(requestBody).substring(0, 500)}...`);
+                  // 克隆请求以避免ReadableStream被消费多次
+                  const clonedRequest = request.clone();
                   
-                  // 直接转发到Google API
-                  console.log(`[DEBUG] 直接转发图像生成请求到Google API`);
+                  // 直接转发到Google API，不尝试解析请求体
+                  console.log(`[DEBUG] 直接转发图像生成请求到Google API: ${modelName}`);
                   const response = await fetch(`${BASE_URL}${pathname}${url.search}`, {
                     method: "POST",
-                    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-                    body: JSON.stringify(requestBody),
+                    headers: makeHeaders(apiKey, { "Content-Type": request.headers.get("Content-Type") || "application/json" }),
+                    body: clonedRequest.body, // 直接使用请求体，不解析
                   });
                   
                   console.log(`[DEBUG] Google API响应状态: ${response.status} ${response.statusText}`);
                   if (!response.ok) {
                     const errorText = await response.text();
                     console.error(`[ERROR] Google API错误响应: ${errorText}`);
+                    return new Response(errorText, fixCors({ status: response.status, statusText: response.statusText }));
                   }
                   
                   return new Response(response.body, fixCors(response));
