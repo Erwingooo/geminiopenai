@@ -17,7 +17,64 @@ export default {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
         }
       };
-      const { pathname } = new URL(request.url);
+      const url = new URL(request.url);
+      const { pathname } = url;
+      
+      // 添加请求日志
+      console.log(`[DEBUG] 收到请求: ${request.method} ${pathname}`);
+      console.log(`[DEBUG] 请求URL: ${request.url}`);
+      console.log(`[DEBUG] 请求头: ${JSON.stringify(Object.fromEntries([...request.headers.entries()]))}`);      
+      
+      // 检查是否为v1beta路径（原生Gemini API路径）
+      if (pathname.includes('/v1beta/')) {
+        console.log(`[DEBUG] 检测到原生Gemini API路径: ${pathname}`);
+        
+        // 检查是否为generateContent或streamGenerateContent端点
+        if (pathname.includes(':generateContent') || pathname.includes(':streamGenerateContent')) {
+          console.log(`[DEBUG] 检测到生成内容端点，尝试提取模型名称`);
+          
+          // 提取模型名称
+          const modelMatch = pathname.match(/\/models\/([^:]+):/); 
+          if (modelMatch && modelMatch[1]) {
+            const modelName = modelMatch[1];
+            console.log(`[DEBUG] 提取的模型名称: ${modelName}`);
+            
+            // 检查是否为图像生成模型
+            if (modelName.includes('image-preview')) {
+              console.log(`[DEBUG] 检测到图像生成模型请求: ${modelName}`);
+              
+              if (request.method === "POST") {
+                try {
+                  // 尝试解析请求体
+                  const requestBody = await request.clone().json();
+                  console.log(`[DEBUG] 图像生成请求体: ${JSON.stringify(requestBody).substring(0, 500)}...`);
+                  
+                  // 直接转发到Google API
+                  console.log(`[DEBUG] 直接转发图像生成请求到Google API`);
+                  const response = await fetch(`${BASE_URL}${pathname}${url.search}`, {
+                    method: "POST",
+                    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+                    body: JSON.stringify(requestBody),
+                  });
+                  
+                  console.log(`[DEBUG] Google API响应状态: ${response.status} ${response.statusText}`);
+                  if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error(`[ERROR] Google API错误响应: ${errorText}`);
+                  }
+                  
+                  return new Response(response.body, fixCors(response));
+                } catch (error) {
+                  console.error(`[ERROR] 处理图像生成请求时出错: ${error.message}`);
+                  throw new HttpError(`处理图像生成请求失败: ${error.message}`, 500);
+                }
+              }
+            }
+          }
+        }
+      }
+      
+      // 标准路径处理
       switch (true) {
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
@@ -32,6 +89,7 @@ export default {
           return handleModels(apiKey)
             .catch(errHandler);
         default:
+          console.log(`[DEBUG] 未匹配的路径: ${pathname}，返回404`);
           throw new HttpError("404 Not Found", 404);
       }
     } catch (err) {
@@ -142,7 +200,18 @@ async function handleEmbeddings (req, apiKey) {
 // 格式检测函数：区分OpenAI格式和原生Gemini格式
 const isNativeGeminiFormat = (req) => {
   // 原生Gemini格式特征：有contents字段且没有messages字段
-  return req.contents && !req.messages;
+  const isNative = req.contents && !req.messages;
+  
+  // 添加特殊日志用于合影功能调试
+  if (req.model && req.model.includes('image-preview')) {
+    console.log(`[DEBUG] 检测到图像生成模型请求: ${req.model}`);
+    console.log(`[DEBUG] 请求格式是否为原生Gemini: ${isNative}`);
+    if (req.contents) {
+      console.log(`[DEBUG] 内容结构: ${JSON.stringify(req.contents).substring(0, 200)}...`);
+    }
+  }
+  
+  return isNative;
 };
 
 // 原生Gemini API直通处理函数
@@ -155,6 +224,27 @@ async function handleNativeGemini (req, apiKey) {
     } else if (req.model.startsWith("gemini-") || req.model.startsWith("gemma-") || req.model.startsWith("learnlm-")) {
       model = req.model;
     }
+  }
+  
+  // 添加详细日志 - 请求信息
+  console.log(`[DEBUG] 处理原生Gemini请求 - 模型: ${model}`);
+  console.log(`[DEBUG] 请求URL: ${BASE_URL}/${API_VERSION}/models/${model}`);
+  console.log(`[DEBUG] 请求内容类型: ${req.contents ? '多模态' : '纯文本'}`);
+  if (req.contents) {
+    console.log(`[DEBUG] 内容部分数量: ${req.contents.length}`);
+    // 检查是否包含图片数据
+    let hasImageData = false;
+    req.contents.forEach((content, idx) => {
+      if (content.parts) {
+        content.parts.forEach(part => {
+          if (part.inline_data) {
+            hasImageData = true;
+            console.log(`[DEBUG] 内容[${idx}]包含图片数据: ${part.inline_data.mime_type}`);
+          }
+        });
+      }
+    });
+    console.log(`[DEBUG] 请求包含图片数据: ${hasImageData}`);
   }
   
   // 构建请求体（直接使用原生格式，无需转换）
@@ -170,22 +260,49 @@ async function handleNativeGemini (req, apiKey) {
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
   
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
+  console.log(`[DEBUG] 发送请求到: ${url}`);
+  console.log(`[DEBUG] 请求体: ${JSON.stringify(body).substring(0, 500)}...`);
   
-  // 直接返回原生Gemini响应，无需格式转换
-  return new Response(response.body, fixCors(response));
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    
+    // 添加详细日志 - 响应信息
+    console.log(`[DEBUG] Gemini API响应状态: ${response.status} ${response.statusText}`);
+    
+    if (!response.ok) {
+      // 如果响应不成功，记录错误详情
+      const errorText = await response.text();
+      console.error(`[ERROR] Gemini API错误响应: ${errorText}`);
+      return new Response(errorText, fixCors({ status: response.status, statusText: response.statusText }));
+    }
+    
+    // 直接返回原生Gemini响应，无需格式转换
+    console.log(`[DEBUG] 成功处理原生Gemini请求，返回响应`);
+    return new Response(response.body, fixCors(response));
+  } catch (error) {
+    console.error(`[ERROR] 处理原生Gemini请求时出错: ${error.message}`);
+    throw new HttpError(`处理Gemini请求失败: ${error.message}`, 500);
+  }
 }
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
 async function handleCompletions (req, apiKey) {
+  // 添加请求日志
+  console.log(`[DEBUG] 收到聊天补全请求 - 路径: /chat/completions`);
+  console.log(`[DEBUG] 请求模型: ${req.model || '未指定'}`);
+  console.log(`[DEBUG] 请求格式: ${isNativeGeminiFormat(req) ? '原生Gemini格式' : 'OpenAI格式'}`);
+  
   // 检测请求格式并选择处理方式
   if (isNativeGeminiFormat(req)) {
+    console.log(`[DEBUG] 检测到原生Gemini格式请求，转发到handleNativeGemini处理`);
     return handleNativeGemini(req, apiKey);
   }
+  
+  console.log(`[DEBUG] 检测到OpenAI格式请求，使用标准处理流程`);
   
   // 以下是原有的OpenAI格式处理逻辑
   let model = DEFAULT_MODEL;
